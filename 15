@@ -1,0 +1,498 @@
+# ==============================================================================
+#
+#       Neurofinder Pipeline: Enhanced Version
+#
+# This script includes:
+#   1. Pre-training visualization of the data preprocessing steps.
+#   2. A custom Keras callback to calculate F1-Score at each epoch.
+#   3. An updated plotting function to include the F1-Score graph.
+#   4. Detailed inference visualization on 8 random validation samples.
+#
+# ==============================================================================
+
+#%%
+
+# --- Core Imports ---
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras import backend as K
+import numpy as np
+import glob
+import os
+import random
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ==============================================================================
+# PHASE 0: PARAMETERS & SETUP
+# ==============================================================================
+print("--- Initializing Parameters ---")
+
+# Enable mixed precision for a massive speedup on compatible GPUs.
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# -- Data Parameters
+IMAGE_DIR = '/home/cdp200004/dataset/images'
+MASK_DIR = '/home/cdp200004/dataset/masks'
+SAVE_DIR = '/home/cdp200004/dataset/' #<-- Directory to save output files
+NUM_FRAMES = 15
+
+# -- Preprocessing & Visualization Parameters
+IMG_HEIGHT = 128
+IMG_WIDTH = 128
+OVERLAY_COLOR_GT = [0, 1, 0]    # Green for Ground Truth
+OVERLAY_COLOR_PRED = [1, 0, 0]  # Red for Prediction
+BG_KERNEL_SIZE = 21
+BG_SIGMA = 10.0
+CLAHE_KERNEL_SIZE = [16, 16]
+CLAHE_CLIP_LIMIT = 2.0
+
+# -- Model & Training Parameters
+INPUT_SHAPE = (IMG_HEIGHT, IMG_WIDTH, NUM_FRAMES)
+INITIAL_LEARNING_RATE = 1e-3
+BATCH_SIZE = 16
+NUM_EPOCHS = 15
+# --- MODIFIED LINES: SAVING TO 'dataset' FOLDER WITH NEW NAMES ---
+CHECKPOINT_PATH = os.path.join(SAVE_DIR, "my_first_model15.keras")
+HISTORY_PLOT_PATH = os.path.join(SAVE_DIR, "my_first_history15.png")
+# --------------------------------------------------------------------
+VALIDATION_SPLIT = 0.2
+INFERENCE_THRESHOLD = 0.5
+
+# ==============================================================================
+# HELPER FUNCTION AND CLASS DEFINITIONS
+# ==============================================================================
+
+# Custom Callback to calculate F1-Score
+class F1ScoreCallback(callbacks.Callback):
+    """A custom callback to calculate F1-score on validation data at the end of each epoch."""
+    def __init__(self, validation_data):
+        super(F1ScoreCallback, self).__init__()
+        self.validation_data = validation_data
+        self.f1_history = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_predict = (self.model.predict(self.validation_data) > INFERENCE_THRESHOLD).astype(np.float32)
+        
+        val_targ = []
+        for _, y in self.validation_data:
+            val_targ.append(y.numpy())
+        val_targ = np.concatenate(val_targ, axis=0)
+
+        val_targ = tf.cast(val_targ, tf.float32)
+        val_predict = tf.cast(val_predict, tf.float32)
+
+        true_positives = K.sum(K.round(K.clip(val_targ * val_predict, 0, 1)))
+        possible_positives = K.sum(K.round(K.clip(val_targ, 0, 1)))
+        predicted_positives = K.sum(K.round(K.clip(val_predict, 0, 1)))
+
+        precision = true_positives / (predicted_positives + K.epsilon())
+        recall = true_positives / (possible_positives + K.epsilon())
+        
+        f1_val = 2 * (precision * recall) / (precision + recall + K.epsilon())
+        
+        self.f1_history.append(f1_val)
+        logs['val_f1'] = f1_val
+        print(f" — val_f1: {f1_val:.4f}")
+        return
+
+@tf.function
+def apply_clahe(img, clip_limit, grid_size):
+    """Applies Contrast Limited Adaptive Histogram Equalization (CLAHE) to an image."""
+    img_shape = tf.shape(img)
+    h, w = img_shape[0], img_shape[1]
+    
+    if img.dtype != tf.float32:
+        img = tf.cast(img, dtype=tf.float32)
+
+    img = img * 255.0
+    img = tf.cast(img, tf.int32)
+
+    grid_h, grid_w = grid_size
+    tile_h, tile_w = h // grid_h, w // grid_w
+
+    hist = tf.zeros((grid_h, grid_w, 256), dtype=tf.int32)
+    
+    for i in range(grid_h):
+        for j in range(grid_w):
+            tile = img[i*tile_h:(i+1)*tile_h, j*tile_w:(j+1)*tile_w]
+            tile_hist = tf.histogram_fixed_width(tile, [0, 255], nbins=256)
+            hist = tf.tensor_scatter_nd_update(hist, [[i, j]], [tile_hist])
+
+    clip_limit_val = tf.maximum(1, tf.cast(clip_limit * tf.cast(tile_h * tile_w, tf.float32) / 256.0, tf.int32))
+    clipped_hist = tf.clip_by_value(hist, 0, clip_limit_val)
+
+    total_clipped = tf.reduce_sum(hist - clipped_hist, axis=-1)
+    redist_val = total_clipped // 256
+    redist_hist = clipped_hist + redist_val[:, :, tf.newaxis]
+    
+    cdf = tf.cumsum(redist_hist, axis=-1)
+    
+    min_cdf = tf.reduce_min(cdf, axis=-1, keepdims=True)
+    max_cdf = tf.reduce_max(cdf, axis=-1, keepdims=True)
+    
+    lut = tf.cast((cdf - min_cdf) * 255, tf.float32) / (tf.cast(max_cdf - min_cdf, tf.float32) + 1e-6)
+    lut = tf.cast(lut, tf.int32)
+
+    padded_lut = tf.pad(lut, [[1, 1], [1, 1], [0, 0]], mode='SYMMETRIC')
+
+    y_grid, x_grid = tf.range(h, dtype=tf.float32), tf.range(w, dtype=tf.float32)
+    
+    y_idx = y_grid / float(tile_h)
+    x_idx = x_grid / float(tile_w)
+
+    i_idx_map, j_idx_map = tf.meshgrid(tf.floor(y_idx), tf.floor(x_idx), indexing='ij')
+    i_idx_map = tf.cast(i_idx_map, tf.int32)
+    j_idx_map = tf.cast(j_idx_map, tf.int32)
+
+    i_flat = tf.reshape(i_idx_map, [-1])
+    j_flat = tf.reshape(j_idx_map, [-1])
+    img_flat = tf.reshape(img, [-1])
+
+    indices_tl = tf.stack([i_flat + 1, j_flat + 1, img_flat], axis=1)
+    indices_tr = tf.stack([i_flat + 1, j_flat + 2, img_flat], axis=1)
+    indices_bl = tf.stack([i_flat + 2, j_flat + 1, img_flat], axis=1)
+    indices_br = tf.stack([i_flat + 2, j_flat + 2, img_flat], axis=1)
+    
+    f_tl = tf.gather_nd(padded_lut, indices_tl)
+    f_tr = tf.gather_nd(padded_lut, indices_tr)
+    f_bl = tf.gather_nd(padded_lut, indices_bl)
+    f_br = tf.gather_nd(padded_lut, indices_br)
+
+    f_tl, f_tr, f_bl, f_br = [tf.reshape(f, (h, w)) for f in [f_tl, f_tr, f_bl, f_br]]
+
+    x_local = x_idx - tf.floor(x_idx)
+    y_local = y_idx - tf.floor(y_idx)
+
+    f_t = (1.0 - x_local) * tf.cast(f_tl, tf.float32) + x_local * tf.cast(f_tr, tf.float32)
+    f_b = (1.0 - x_local) * tf.cast(f_bl, tf.float32) + x_local * tf.cast(f_br, tf.float32)
+    f_interp = (1.0 - y_local[:, tf.newaxis]) * f_t + y_local[:, tf.newaxis] * f_b
+
+    final_img = f_interp / 255.0
+    return final_img[:, :, tf.newaxis]
+
+def gaussian_blur(image, kernel_size, sigma):
+    """Applies a Gaussian Blur, used here to estimate the background."""
+    x = tf.cast(tf.range(-kernel_size // 2 + 1, kernel_size // 2 + 1), dtype=tf.float32)
+    g = tf.exp(-(tf.pow(x, 2) / (2 * tf.pow(tf.cast(sigma, dtype=tf.float32), 2))))
+    g_norm = g / tf.reduce_sum(g)
+    kernel_1d = tf.reshape(g_norm, [kernel_size, 1])
+    kernel_2d = tf.matmul(kernel_1d, tf.transpose(kernel_1d))
+    kernel = tf.expand_dims(tf.expand_dims(kernel_2d, axis=-1), axis=-1)
+    img_4d = tf.reshape(image, [1, IMG_HEIGHT, IMG_WIDTH, 1])
+    blurred_4d = tf.nn.conv2d(img_4d, filters=kernel, strides=[1, 1, 1, 1], padding="SAME")
+    return tf.squeeze(blurred_4d, axis=0)
+
+def _load_and_preprocess_single_frame(frame_path, return_steps=False):
+    """Helper function to process one frame path, optionally returning intermediate steps."""
+    img_raw = tf.io.read_file(frame_path)
+    img_raw = tf.image.decode_png(img_raw, channels=1)
+    img_raw = tf.image.resize(img_raw, (IMG_HEIGHT, IMG_WIDTH))
+    img_raw = tf.image.convert_image_dtype(img_raw, tf.float32)
+
+    background = gaussian_blur(img_raw, BG_KERNEL_SIZE, BG_SIGMA)
+    img_no_bg = tf.clip_by_value(img_raw - background, 0, 1.0)
+    
+    grid_h = IMG_HEIGHT // CLAHE_KERNEL_SIZE[0]
+    grid_w = IMG_WIDTH // CLAHE_KERNEL_SIZE[1]
+    
+    img_clahe = apply_clahe(img_no_bg, clip_limit=CLAHE_CLIP_LIMIT, grid_size=(grid_h, grid_w))
+    
+    min_val, max_val = tf.reduce_min(img_clahe), tf.reduce_max(img_clahe)
+    img_final = (img_clahe - min_val) / (max_val - min_val + 1e-7)
+    
+    if return_steps:
+        return img_raw, img_no_bg, img_clahe, img_final
+    return img_final
+
+def load_and_preprocess_data(frame_paths, mask_path, augment=False):
+    """Loads a stack of frames and a single central mask, then preprocesses."""
+    processed_frames = tf.map_fn(
+        _load_and_preprocess_single_frame,
+        frame_paths,
+        fn_output_signature=tf.TensorSpec(shape=[IMG_HEIGHT, IMG_WIDTH, 1], dtype=tf.float32)
+    )
+    
+    img_stack = tf.concat(tf.unstack(processed_frames, axis=0), axis=-1)
+    img_stack.set_shape([IMG_HEIGHT, IMG_WIDTH, NUM_FRAMES])
+
+    mask = tf.io.read_file(mask_path)
+    mask = tf.image.decode_png(mask, channels=1)
+    mask = tf.image.resize(mask, (IMG_HEIGHT, IMG_WIDTH))
+    mask = tf.cast(mask > (tf.reduce_max(mask) / 2.0), dtype=tf.float32)
+
+    if augment:
+        if tf.random.uniform(()) > 0.5:
+            img_stack = tf.image.flip_left_right(img_stack)
+            mask = tf.image.flip_left_right(mask)
+        if tf.random.uniform(()) > 0.5:
+            img_stack = tf.image.flip_up_down(img_stack)
+            mask = tf.image.flip_up_down(mask)
+
+    return img_stack, mask
+
+def dice_loss(y_true, y_pred, smooth=1e-6):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    y_true_f, y_pred_f = K.flatten(y_true), K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return 1 - ((2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth))
+
+def combo_loss(y_true, y_pred):
+    return tf.keras.losses.binary_crossentropy(y_true, y_pred) + dice_loss(y_true, y_pred)
+
+def build_unet_model(input_shape):
+    """Builds a U-Net model compatible with multi-channel input."""
+    inputs = layers.Input(input_shape)
+    c1 = layers.Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(inputs)
+    c1 = layers.Dropout(0.1)(c1)
+    c1 = layers.Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c1)
+    p1 = layers.MaxPooling2D((2, 2))(c1)
+
+    c2 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p1)
+    c2 = layers.Dropout(0.1)(c2)
+    c2 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c2)
+    p2 = layers.MaxPooling2D((2, 2))(c2)
+
+    c_deep = layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(p2)
+    c_deep = layers.Dropout(0.2)(c_deep)
+    c_deep = layers.Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c_deep)
+
+    u6 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c_deep)
+    u6 = layers.concatenate([u6, c2])
+    c6 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u6)
+    c6 = layers.Dropout(0.1)(c6)
+    c6 = layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c6)
+
+    u7 = layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same')(c6)
+    u7 = layers.concatenate([u7, c1])
+    c7 = layers.Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(u7)
+    c7 = layers.Dropout(0.1)(c7)
+    c7 = layers.Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same')(c7)
+    
+    outputs = layers.Conv2D(1, (1, 1), activation='sigmoid', dtype=tf.float32)(c7)
+    return models.Model(inputs=[inputs], outputs=[outputs])
+
+def plot_and_save_history(history, f1_callback, file_path):
+    """Plots training history including F1-score and saves it to a file."""
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5)) # Increased figure size for 4 plots
+    fig.suptitle("Model Training History", fontsize=16)
+    
+    # Plot Loss, Precision, Recall
+    metrics = ['loss', 'precision', 'recall']
+    for i, metric in enumerate(metrics):
+        axes[i].plot(history.history[metric], label=f'Training {metric.capitalize()}')
+        axes[i].plot(history.history[f'val_{metric}'], label=f'Validation {metric.capitalize()}')
+        axes[i].set_title(f'{metric.capitalize()} Over Epochs')
+        axes[i].set_xlabel('Epoch')
+        axes[i].set_ylabel(metric.capitalize())
+        axes[i].legend()
+        axes[i].grid(True)
+        
+    # Plot F1 Score
+    axes[3].plot(f1_callback.f1_history, label='Validation F1-Score', color='purple')
+    axes[3].set_title('F1-Score Over Epochs')
+    axes[3].set_xlabel('Epoch')
+    axes[3].set_ylabel('F1-Score')
+    axes[3].legend()
+    axes[3].grid(True)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(file_path)
+    plt.close()
+    print(f"Training history plot saved to: {file_path}")
+
+def run_preprocessing_visualization(frame_paths, mask_paths, num_samples=8):
+    """Visualizes the preprocessing steps for a number of random samples."""
+    print(f"\n--- PHASE 1: Preprocessing Visualization ---")
+    print(f"Displaying preprocessing pipeline for {num_samples} random samples...")
+    
+    center_offset = NUM_FRAMES // 2
+    sample_indices = random.sample(range(len(frame_paths) - NUM_FRAMES), num_samples)
+
+    for i, start_idx in enumerate(sample_indices):
+        center_frame_path = frame_paths[start_idx + center_offset]
+        mask_path = mask_paths[start_idx + center_offset]
+        
+        # Load and preprocess the center frame, getting intermediate steps
+        img_raw, img_no_bg, img_clahe, img_final = _load_and_preprocess_single_frame(center_frame_path, return_steps=True)
+        
+        # Load the ground truth mask
+        mask = tf.io.read_file(mask_path)
+        mask = tf.image.decode_png(mask, channels=1)
+        mask = tf.image.resize(mask, (IMG_HEIGHT, IMG_WIDTH))
+        mask = tf.cast(mask > 0, dtype=tf.float32)
+
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        fig.suptitle(f"Advanced Preprocessing Pipeline for Sample {i+1}", fontsize=16)
+
+        axes[0].imshow(img_raw, cmap='gray')
+        axes[0].set_title("1. Raw Original Image")
+        axes[0].axis('off')
+
+        axes[1].imshow(img_no_bg, cmap='gray')
+        axes[1].set_title("2. After Background Subtraction")
+        axes[1].axis('off')
+
+        axes[2].imshow(img_clahe, cmap='gray')
+        axes[2].set_title("3. After CLAHE Enhancement")
+        axes[2].axis('off')
+
+        axes[3].imshow(img_final, cmap='gray')
+        gt_overlay = np.zeros((*mask.shape[:2], 4), dtype=np.float32)
+        gt_overlay[mask[:, :, 0] > 0, :3] = OVERLAY_COLOR_GT
+        gt_overlay[mask[:, :, 0] > 0, 3] = 0.5 # Semi-transparent
+        axes[3].imshow(gt_overlay)
+        axes[3].set_title("4. Final Input for Model (with GT)")
+        axes[3].axis('off')
+
+        gt_patch = mpatches.Patch(color=OVERLAY_COLOR_GT, label='Ground Truth Mask')
+        fig.legend(handles=[gt_patch], loc='lower center', ncol=1, bbox_to_anchor=(0.5, 0.02))
+
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        plt.show()
+
+def run_inference_and_visualize_detailed(model, dataset, num_samples=8):
+    """Runs inference and creates detailed visualizations for random samples."""
+    print(f"\n--- PHASE 4: Detailed Inference and Visualization ---")
+    print(f"Running inference on {num_samples} random validation samples...")
+    center_frame_idx = NUM_FRAMES // 2
+
+    for image_stack, gt_mask in dataset.shuffle(100).take(num_samples):
+        image_batch = image_stack[tf.newaxis, ...]
+        predicted_mask_batch = model.predict(image_batch)
+        
+        predicted_prob_map = predicted_mask_batch[0]
+        predicted_mask_binary = (predicted_prob_map > INFERENCE_THRESHOLD).astype(np.uint8)
+
+        display_image = image_stack[:, :, center_frame_idx]
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+        fig.suptitle("Detailed Inference Analysis", fontsize=16)
+
+        axes[0, 0].imshow(display_image, cmap='gray')
+        axes[0, 0].set_title(f"1. Preprocessed Input (Center Frame)")
+        axes[0, 0].axis('off')
+
+        axes[0, 1].imshow(display_image, cmap='gray')
+        gt_overlay = np.zeros((*gt_mask.shape[:2], 4), dtype=np.float32)
+        gt_overlay[gt_mask[:, :, 0] > 0, :3] = OVERLAY_COLOR_GT
+        gt_overlay[gt_mask[:, :, 0] > 0, 3] = 0.6
+        axes[0, 1].imshow(gt_overlay)
+        axes[0, 1].set_title("2. Ground Truth (The Answer)")
+        axes[0, 1].axis('off')
+
+        axes[1, 0].imshow(display_image, cmap='gray')
+        pred_overlay = np.zeros((*predicted_mask_binary.shape[:2], 4), dtype=np.float32)
+        pred_overlay[predicted_mask_binary[:, :, 0] > 0, :3] = OVERLAY_COLOR_PRED
+        pred_overlay[predicted_mask_binary[:, :, 0] > 0, 3] = 0.6
+        axes[1, 0].imshow(pred_overlay)
+        axes[1, 0].set_title("3. Final Prediction (Overlay)")
+        axes[1, 0].axis('off')
+        
+        prob_plot = axes[1, 1].imshow(predicted_prob_map, cmap='viridis', vmin=0, vmax=1)
+        axes[1, 1].set_title("4. Model's Confidence Heatmap")
+        axes[1, 1].axis('off')
+        fig.colorbar(prob_plot, ax=axes[1, 1], shrink=0.8)
+        
+        gt_patch = mpatches.Patch(color=OVERLAY_COLOR_GT, label='Ground Truth')
+        pred_patch = mpatches.Patch(color=OVERLAY_COLOR_PRED, label='Prediction')
+        fig.legend(handles=[gt_patch, pred_patch], loc='lower center', ncol=2, bbox_to_anchor=(0.5, 0.02))
+
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        plt.show()
+
+# ==============================================================================
+# MAIN EXECUTION BLOCK
+# ==============================================================================
+if __name__ == "__main__":
+    
+    print("\nLocating data files...")
+    all_image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR, '*.png')))
+    all_mask_paths = sorted(glob.glob(os.path.join(MASK_DIR, '*.png')))
+
+    if not all_image_paths or not all_mask_paths or len(all_image_paths) < NUM_FRAMES:
+        print(f"\n\u274C ERROR: Halting script. Not enough data found for {NUM_FRAMES}-frame stacks.")
+    else:
+        # --- PHASE 1: Preprocessing Visualization ---
+        run_preprocessing_visualization(all_image_paths, all_mask_paths, num_samples=8)
+
+        # --- PHASE 2: Data Preparation ---
+        print(f"\n--- PHASE 2: Data Preparation & Model Training ---")
+        print(f"Found {len(all_image_paths)} images. Grouping into {NUM_FRAMES}-frame stacks...")
+        frame_groups = []
+        target_masks = []
+        center_offset = NUM_FRAMES // 2
+
+        for i in range(len(all_image_paths) - NUM_FRAMES + 1):
+            frame_groups.append(all_image_paths[i : i + NUM_FRAMES])
+            target_masks.append(all_mask_paths[i + center_offset])
+        
+        print(f"Created {len(frame_groups)} overlapping frame stacks.")
+        
+        train_groups, val_groups, train_masks, val_masks = train_test_split(
+            frame_groups, target_masks, test_size=VALIDATION_SPLIT, random_state=42
+        )
+        
+        train_dataset = tf.data.Dataset.from_tensor_slices((train_groups, train_masks))
+        train_dataset = train_dataset.map(lambda x, y: load_and_preprocess_data(x, y, augment=True), num_parallel_calls=tf.data.AUTOTUNE)
+        train_dataset = train_dataset.shuffle(1000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+        val_dataset = tf.data.Dataset.from_tensor_slices((val_groups, val_masks))
+        val_dataset = val_dataset.map(load_and_preprocess_data, num_parallel_calls=tf.data.AUTOTUNE)
+        val_dataset = val_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        print("Datasets with temporal stacking and augmentation created successfully.")
+
+        # --- PHASE 3: Model Training ---
+        print("\n--- PHASE 3: Model Training ---")
+        print("Building and compiling the U-Net model...")
+        model = build_unet_model(INPUT_SHAPE)
+        
+        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+            INITIAL_LEARNING_RATE,
+            decay_steps=(len(train_groups)) // BATCH_SIZE * 2,
+            decay_rate=0.90
+        )
+
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+        
+        model.compile(
+            optimizer=optimizer,
+            loss=combo_loss,
+            metrics=[tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall')]
+        )
+        
+        # Instantiate the custom F1 Score callback
+        f1_callback = F1ScoreCallback(validation_data=val_dataset)
+
+        print(f"\nStarting model training for {NUM_EPOCHS} epochs... 🚀")
+        history = model.fit(
+            train_dataset, 
+            epochs=NUM_EPOCHS, 
+            validation_data=val_dataset,
+            callbacks=[f1_callback] # Add the callback here
+        )
+        print("\n\u2705 Training finished!")
+
+        print("\nSaving final model and performance plots...")
+        model.save(CHECKPOINT_PATH)
+        print(f"Trained model saved to: {CHECKPOINT_PATH}")
+        
+        plot_and_save_history(history, f1_callback, HISTORY_PLOT_PATH)
+
+        print("\n--- Final Model Performance on Validation Set ---")
+        final_val_precision = history.history['val_precision'][-1]
+        final_val_recall = history.history['val_recall'][-1]
+        final_val_f1 = f1_callback.f1_history[-1] # Get the last F1 score from our callback
+        
+        print(f"  - Validation Precision: {final_val_precision:.4f}")
+        print(f"  - Validation Recall:    {final_val_recall:.4f}")
+        print(f"  - Validation F1-Score:  {final_val_f1:.4f}")
+
+        # --- PHASE 4: Detailed Inference ---
+        val_dataset_for_inference = tf.data.Dataset.from_tensor_slices((val_groups, val_masks)).map(load_and_preprocess_data)
+        run_inference_and_visualize_detailed(model, val_dataset_for_inference, num_samples=8)
+
+        print("\n--- ✅ SCRIPT FINISHED. ---")
