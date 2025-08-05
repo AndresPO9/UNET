@@ -1,0 +1,442 @@
+
+#Neurofinder, HNCcorr architecture with 15 Frame Temporal Stacking
+
+#Key imports.
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, backend as K
+import numpy as np
+import glob
+import os
+import random
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from skimage.exposure import equalize_adapthist # For CLAHE
+
+#-------------------------------------------------------------------------------
+#Parameters and setup.
+
+print("Initializing Parameters.")
+
+
+
+#Data Parameters.
+IMAGEDIR = '/home/cdp200004/dataset/images'
+MASKDIR = '/home/cdp200004/dataset/masks'
+SAVEDIR = '/home/cdp200004/dataset/' 
+NUMFRAMES = 5 
+
+#Preprocessing and Visualization parameters.
+IMG_HEIGHT = 128
+IMG_WIDTH = 128
+OVERLAY_COLOR_GT = [0, 1, 0]   # Green for Ground Truth
+OVERLAY_COLOR_PRED = [1, 0, 0]   # Red for Prediction
+BG_KERNEL_SIZE = 21
+BG_SIGMA = 10.0
+CLAHE_KERNEL_SIZE = [16, 16]
+CLAHE_CLIP_LIMIT = 0.02
+
+#HNCcorr Model and Training Parameters.
+INPUT_SHAPE = (IMG_HEIGHT, IMG_WIDTH, NUMFRAMES)
+INITIAL_LEARNING_RATE = 1e-4
+BATCH_SIZE = 8
+NUM_EPOCHS = 15
+VALIDATION_SPLIT = 0.2
+INFERENCE_THRESHOLD = 0.5
+
+
+CHECKPOINT_PATH = os.path.join(SAVEDIR, "hnccorr_model_15frame.keras")
+HISTORY_PLOT_PATH = os.path.join(SAVEDIR, "hnccorr_history_15frame.png")
+
+
+#Architecture Hyperparameters.
+PATCH_SIZE = 4
+PROJECTION_DIM = 96
+NUM_TRANSFORMER_LAYERS = 4
+NUM_HEADS = 4
+MLP_UNITS = [PROJECTION_DIM * 2, PROJECTION_DIM]
+
+#-------------------------------------------------------------------------------
+#Helper Function and Class Definitions.
+
+
+#Callback to calculate F1-Score.
+class F1ScoreCallback(callbacks.Callback):
+    """A callback to calculate F1 score on validation data at the end of each epoch."""
+    def __init__(self, validation_data):
+        super(F1ScoreCallback, self).__init__()
+        self.validation_data = validation_data
+        self.f1_history = []
+
+    def on_epoch_end(self, epoch, logs=None):
+        #Initialize variables to accumulate for the metrics.
+        true_positives_acc = 0.0
+        possible_positives_acc = 0.0
+        predicted_positives_acc = 0.0
+
+        #Iterate over the validation dataset batch by batch to save GPU memory.
+        for x_val, y_val in self.validation_data:
+            # Predict on the current batch only
+            val_predict = self.model.predict_on_batch(x_val)
+            val_predict = tf.cast(val_predict > INFERENCE_THRESHOLD, tf.float32)
+            y_val = tf.cast(y_val, tf.float32)
+            
+            #Calculate metrics for the data to accumulate results.
+            true_positives_acc += K.sum(K.round(K.clip(y_val * val_predict, 0, 1)))
+            possible_positives_acc += K.sum(K.round(K.clip(y_val, 0, 1)))
+            predicted_positives_acc += K.sum(K.round(K.clip(val_predict, 0, 1)))
+
+        #Calculate final precision, recall, and F1 for all the data.
+        precision = true_positives_acc / (predicted_positives_acc + K.epsilon())
+        recall = true_positives_acc / (possible_positives_acc + K.epsilon())
+        f1_val = 2 * (precision * recall) / (precision + recall + K.epsilon())
+        
+        self.f1_history.append(f1_val)
+        logs['val_f1'] = f1_val
+        print(f" — val_f1: {f1_val:.4f}")
+        return
+def gaussian_blur(image, kernel_size, sigma):
+    """Applies a Gaussian Blur used here to estimate the background."""
+    x = tf.cast(tf.range(-kernel_size // 2 + 1, kernel_size // 2 + 1), dtype=tf.float32)
+    g = tf.exp(-(tf.pow(x, 2) / (2 * tf.pow(tf.cast(sigma, dtype=tf.float32), 2))))
+    g_norm = g / tf.reduce_sum(g)
+    kernel_1d = tf.reshape(g_norm, [kernel_size, 1])
+    kernel_2d = tf.matmul(kernel_1d, tf.transpose(kernel_1d))
+    kernel = tf.expand_dims(tf.expand_dims(kernel_2d, axis=-1), axis=-1)
+    img_4d = image[tf.newaxis, ...]
+    blurred_4d = tf.nn.conv2d(img_4d, filters=kernel, strides=[1, 1, 1, 1], padding="SAME")
+    return tf.squeeze(blurred_4d, axis=0)
+
+def apply_clahe(image):
+    """Scikit type image with TensorFlow function."""
+    # Squeeze to make it a 2D array for scikit-image
+    image_np_2d = np.squeeze(image.numpy())
+    clahe_image = equalize_adapthist(image_np_2d, kernel_size=CLAHE_KERNEL_SIZE, clip_limit=CLAHE_CLIP_LIMIT)
+    # Return as a tensor and add the channel dimension back
+    clahe_image = tf.convert_to_tensor(clahe_image, dtype=tf.float32)
+    return tf.expand_dims(clahe_image, axis=-1)
+
+def _load_and_preprocess_single_frame(frame_path, return_steps=False):
+    """Helper function to process one frame path."""
+    img_raw = tf.io.read_file(frame_path)
+    img_raw = tf.image.decode_png(img_raw, channels=1)
+    img_raw = tf.image.resize(img_raw, (IMG_HEIGHT, IMG_WIDTH))
+    img_raw = tf.image.convert_image_dtype(img_raw, tf.float32)
+
+    background = gaussian_blur(img_raw, BG_KERNEL_SIZE, BG_SIGMA)
+    img_no_bg = tf.clip_by_value(img_raw - background, 0, 1.0)
+    
+    img_clahe = tf.py_function(func=apply_clahe, inp=[img_no_bg], Tout=tf.float32)
+    img_clahe.set_shape([IMG_HEIGHT, IMG_WIDTH, 1])
+
+    min_val, max_val = tf.reduce_min(img_clahe), tf.reduce_max(img_clahe)
+    img_final = (img_clahe - min_val) / (max_val - min_val + 1e-7)
+    
+    if return_steps:
+        return img_raw, img_no_bg, img_clahe, img_final
+    return img_final
+
+def load_and_preprocess_data(frame_paths, mask_path, augment=False):
+    """Loads a stack of frames to preprocesses."""
+    processed_frames = tf.map_fn(
+        _load_and_preprocess_single_frame,
+        frame_paths,
+        fn_output_signature=tf.TensorSpec(shape=[IMG_HEIGHT, IMG_WIDTH, 1], dtype=tf.float32)
+    )
+    
+    img_stack = tf.concat(tf.unstack(processed_frames, axis=0), axis=-1)
+    img_stack.set_shape([IMG_HEIGHT, IMG_WIDTH, NUMFRAMES])
+
+    mask = tf.io.read_file(mask_path)
+    mask = tf.image.decode_png(mask, channels=1)
+    mask = tf.image.resize(mask, (IMG_HEIGHT, IMG_WIDTH))
+    mask = tf.cast(mask > (tf.reduce_max(mask) / 2.0), dtype=tf.float32)
+
+    if augment:
+        if tf.random.uniform(()) > 0.5:
+            img_stack = tf.image.flip_left_right(img_stack)
+            mask = tf.image.flip_left_right(mask)
+        if tf.random.uniform(()) > 0.5:
+            img_stack = tf.image.flip_up_down(img_stack)
+            mask = tf.image.flip_up_down(mask)
+
+    return img_stack, mask
+
+def dice_loss(y_true, y_pred, smooth=1e-6):
+    y_true_f, y_pred_f = K.flatten(y_true), K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return 1 - ((2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth))
+
+def combo_loss(y_true, y_pred):
+    return tf.keras.losses.binary_crossentropy(y_true, y_pred) + dice_loss(y_true, y_pred)
+
+#-------------------------------------------------------------------------------
+# HNCcorr Building.
+
+class PatchEmbedding(layers.Layer):
+    """Layer to convert a 2D feature map into a 1D sequence of flattened patches."""
+    def __init__(self, patch_size, projection_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_size = patch_size
+        self.projection = layers.Conv2D(
+            filters=projection_dim,
+            kernel_size=patch_size,
+            strides=patch_size,
+            padding="VALID"
+        )
+        self.flatten = layers.Reshape(target_shape=(-1, projection_dim))
+
+    def call(self, images):
+        x = self.projection(images)
+        return self.flatten(x)
+
+class TransformerEncoder(layers.Layer):
+    """Standard Transformer Encoder Block"""
+    def __init__(self, projection_dim, num_heads, mlp_units, dropout_rate=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.attention = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim, dropout=dropout_rate
+        )
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.mlp = models.Sequential([
+            layers.Dense(units, activation='gelu') for units in mlp_units
+        ])
+        self.add = layers.Add()
+
+    def call(self, x):
+        x_norm = self.norm1(x)
+        attention_output = self.attention(query=x_norm, value=x_norm, key=x_norm)
+        x1 = self.add([x, attention_output])
+        x1_norm = self.norm2(x1)
+        mlp_output = self.mlp(x1_norm)
+        return self.add([x1, mlp_output])
+
+class CorrelationBlock(layers.Layer):
+    """Correlates local CNN features with global Transformer features."""
+    def __init__(self, projection_dim, num_heads, **kwargs):
+        super().__init__(**kwargs)
+        self.attention = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=projection_dim
+        )
+        self.norm = layers.LayerNormalization(epsilon=1e-6)
+        self.add = layers.Add()
+
+    def call(self, inputs):
+        cnn_features, transformer_features = inputs
+        correlation_output = self.attention(
+            query=cnn_features, value=transformer_features, key=transformer_features
+        )
+        return self.add([cnn_features, self.norm(correlation_output)])
+
+#-------------------------------------------------------------------------------
+#HNCcorr Model
+
+def build_hnccorr_model(input_shape):
+    """Builds the HNCcorr model, now compatible with multi-frame input."""
+    inputs = layers.Input(shape=input_shape)
+    
+    #1.CNN ENCODER STEM ---
+    # The first Conv2D layer will automatically handle the 15-channel input.
+    c1 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(inputs)
+    c1 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c1)
+    p1 = layers.MaxPooling2D(pool_size=2)(c1)
+    
+    c2 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(p1)
+    c2 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c2)
+    p2 = layers.MaxPooling2D(pool_size=2)(c2)
+
+    c3 = layers.Conv2D(PROJECTION_DIM, 3, activation='relu', padding='same', kernel_initializer='he_normal')(p2)
+    c3 = layers.Conv2D(PROJECTION_DIM, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c3)
+    
+    #2.Transformer Branch.
+    patches = PatchEmbedding(PATCH_SIZE, PROJECTION_DIM)(c3)
+    num_patches = patches.shape[1]
+    pos_embedding = tf.Variable(tf.random.normal(shape=(1, num_patches, PROJECTION_DIM)), trainable=True)
+    patches_with_pos = patches + pos_embedding
+    
+    transformer_out = patches_with_pos
+    for _ in range(NUM_TRANSFORMER_LAYERS):
+        transformer_out = TransformerEncoder(PROJECTION_DIM, NUM_HEADS, MLP_UNITS)(transformer_out)
+
+    #3.Correlate and Fusion.
+    feature_map_size = input_shape[0] // (2 * 2 * PATCH_SIZE)
+    reshaped_transformer = layers.Reshape((feature_map_size, feature_map_size, PROJECTION_DIM))(transformer_out)
+    c3_seq = layers.Reshape((-1, PROJECTION_DIM))(c3)
+    transformer_seq = layers.Reshape((-1, PROJECTION_DIM))(reshaped_transformer)
+    fused_features_seq = CorrelationBlock(PROJECTION_DIM, NUM_HEADS)([c3_seq, transformer_seq])
+    fused_features_2d = layers.Reshape((c3.shape[1], c3.shape[2], PROJECTION_DIM))(fused_features_seq)
+    
+    u4 = layers.Conv2DTranspose(64, 2, strides=2, padding='same')(fused_features_2d)
+    u4 = layers.concatenate([u4, c2])
+    c4 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(u4)
+    c4 = layers.Conv2D(64, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c4)
+
+    u5 = layers.Conv2DTranspose(32, 2, strides=2, padding='same')(c4)
+    u5 = layers.concatenate([u5, c1])
+    c5 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(u5)
+    c5 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c5)
+
+    outputs = layers.Conv2D(1, (1, 1), activation='sigmoid')(c5)
+    
+    return models.Model(inputs=[inputs], outputs=[outputs])
+
+#-------------------------------------------------------------------------------
+#Visualizations and Main block
+
+def plot_and_save_history(history, f1_callback, file_path):
+    """Plots training history including F1-score and saves it to a file."""
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5))
+    fig.suptitle("HNCcorr Model Training History (15-Frame Input)", fontsize=16)
+    
+    metrics = ['loss', 'precision', 'recall']
+    for i, metric in enumerate(metrics):
+        axes[i].plot(history.history[metric], label=f'Training {metric.capitalize()}')
+        axes[i].plot(history.history[f'val_{metric}'], label=f'Validation {metric.capitalize()}')
+        axes[i].set_title(f'{metric.capitalize()} Over Epochs')
+        axes[i].set_xlabel('Epoch'); axes[i].set_ylabel(metric.capitalize()); axes[i].legend(); axes[i].grid(True)
+        
+    axes[3].plot(f1_callback.f1_history, label='Validation F1-Score', color='purple')
+    axes[3].set_title('F1-Score Over Epochs'); axes[3].set_xlabel('Epoch'); axes[3].set_ylabel('F1-Score'); axes[3].legend(); axes[3].grid(True)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(file_path)
+    plt.close()
+    print(f"Training history plot saved to: {file_path}")
+
+def run_preprocessing_visualization(frame_paths, mask_paths, num_samples=8):
+    """Visualizes the preprocessing steps for a number of random samples."""
+    print(f"\n--- PHASE 1: Preprocessing Visualization ---")
+    print(f"Displaying preprocessing pipeline for {num_samples} random samples...")
+    
+    center_offset = NUMFRAMES // 2
+    sample_indices = random.sample(range(len(frame_paths) - NUMFRAMES), num_samples)
+
+    for i, start_idx in enumerate(sample_indices):
+        center_frame_path = frame_paths[start_idx + center_offset]
+        mask_path = mask_paths[start_idx + center_offset]
+        
+        img_raw, img_no_bg, img_clahe, img_final = _load_and_preprocess_single_frame(center_frame_path, return_steps=True)
+        mask = tf.io.read_file(mask_path); mask = tf.image.decode_png(mask, channels=1); mask = tf.image.resize(mask, (IMG_HEIGHT, IMG_WIDTH)); mask = tf.cast(mask > 0, dtype=tf.float32)
+
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5)); fig.suptitle(f"Advanced Preprocessing Pipeline for Sample {i+1}", fontsize=16)
+        axes[0].imshow(img_raw, cmap='gray'); axes[0].set_title("1. Raw Original Image"); axes[0].axis('off')
+        axes[1].imshow(img_no_bg, cmap='gray'); axes[1].set_title("2. After Background Subtraction"); axes[1].axis('off')
+        axes[2].imshow(np.squeeze(img_clahe.numpy()), cmap='gray'); axes[2].set_title("3. After CLAHE Enhancement"); axes[2].axis('off')
+        axes[3].imshow(np.squeeze(img_final.numpy()), cmap='gray')
+        gt_overlay = np.zeros((*mask.shape[:2], 4)); gt_overlay[mask[:, :, 0] > 0, :3] = OVERLAY_COLOR_GT; gt_overlay[mask[:, :, 0] > 0, 3] = 0.5; axes[3].imshow(gt_overlay)
+        axes[3].set_title("4. Final Input for Model (with GT)"); axes[3].axis('off')
+        gt_patch = mpatches.Patch(color=OVERLAY_COLOR_GT, label='Ground Truth Mask'); fig.legend(handles=[gt_patch], loc='lower center', ncol=1, bbox_to_anchor=(0.5, 0.02))
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95]); plt.show()
+
+def run_inference_and_visualize_detailed(model, dataset, num_samples=8):
+    """Runs inference and creates detailed visualizations for random samples."""
+    print(f"\n4.Detailed Inference and Visualizations.")
+    print(f"Running inference on {num_samples} random validation samples.")
+    center_frame_idx = NUMFRAMES // 2
+
+    for image_stack, gt_mask in dataset.shuffle(100).take(num_samples):
+        image_batch = image_stack[tf.newaxis, ...]
+        predicted_mask_batch = model.predict(image_batch, verbose=0)
+        
+        predicted_prob_map = predicted_mask_batch[0]
+        predicted_mask_binary = (predicted_prob_map > INFERENCE_THRESHOLD).astype(np.uint8)
+        display_image = image_stack[:, :, center_frame_idx] # Visualize the center frame
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 12)); fig.suptitle("Detailed Inference Analysis (HNCcorr)", fontsize=16)
+        axes[0, 0].imshow(display_image, cmap='gray'); axes[0, 0].set_title("1. Preprocessed Input (Center Frame)"); axes[0, 0].axis('off')
+        axes[0, 1].imshow(display_image, cmap='gray'); gt_overlay = np.zeros((*gt_mask.shape[:2], 4)); gt_overlay[gt_mask[:, :, 0] > 0, :3] = OVERLAY_COLOR_GT; gt_overlay[gt_mask[:, :, 0] > 0, 3] = 0.6; axes[0, 1].imshow(gt_overlay); axes[0, 1].set_title("2. Ground Truth"); axes[0, 1].axis('off')
+        axes[1, 0].imshow(display_image, cmap='gray'); pred_overlay = np.zeros((*predicted_mask_binary.shape[:2], 4)); pred_overlay[predicted_mask_binary[:, :, 0] > 0, :3] = OVERLAY_COLOR_PRED; pred_overlay[predicted_mask_binary[:, :, 0] > 0, 3] = 0.6; axes[1, 0].imshow(pred_overlay); axes[1, 0].set_title("3.Final Prediction"); axes[1, 0].axis('off')
+        prob_plot = axes[1, 1].imshow(predicted_prob_map, cmap='viridis', vmin=0, vmax=1); axes[1, 1].set_title("4.Model's Confidence Heatmap"); axes[1, 1].axis('off'); fig.colorbar(prob_plot, ax=axes[1, 1], shrink=0.8)
+        gt_patch = mpatches.Patch(color=OVERLAY_COLOR_GT, label='Ground Truth'); pred_patch = mpatches.Patch(color=OVERLAY_COLOR_PRED, label='Prediction'); fig.legend(handles=[gt_patch, pred_patch], loc='lower center', ncol=2, bbox_to_anchor=(0.5, 0.02))
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95]); plt.show()
+
+#-------------------------------------------------------------------------------
+# Main Block
+if __name__ == "__main__":
+    
+    print("\nLocating data files.")
+    all_image_paths = sorted(glob.glob(os.path.join(IMAGEDIR, '*.png')))
+    all_mask_paths = sorted(glob.glob(os.path.join(MASKDIR, '*.png')))
+
+    if not all_image_paths or not all_mask_paths or len(all_image_paths) < NUMFRAMES:
+        print(f"\n\u274CError. Stop script. Not enough data found for {NUMFRAMES}-frame stacks.")
+    else:
+        #1.Preprocessing Visualization.
+        run_preprocessing_visualization(all_image_paths, all_mask_paths, num_samples=8)
+
+        #2.Data Preparation.
+        print(f"\n Data Prep and Model Training.")
+        print(f"Found {len(all_image_paths)} images. Grouping into {NUMFRAMES}-frame stacks...")
+        frame_groups = []
+        target_masks = []
+        center_offset = NUMFRAMES // 2
+
+        for i in range(len(all_image_paths) - NUMFRAMES + 1):
+            frame_groups.append(all_image_paths[i : i + NUMFRAMES])
+            target_masks.append(all_mask_paths[i + center_offset])
+        
+        print(f"Created {len(frame_groups)} overlapping frame stacks.")
+        
+        train_groups, val_groups, train_masks, val_masks = train_test_split(
+            frame_groups, target_masks, test_size=VALIDATION_SPLIT, random_state=42
+        )
+        
+        train_dataset = tf.data.Dataset.from_tensor_slices((train_groups, train_masks))
+        train_dataset = train_dataset.map(lambda x, y: load_and_preprocess_data(x, y, augment=True), num_parallel_calls=tf.data.AUTOTUNE)
+        train_dataset = train_dataset.shuffle(1000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+        val_dataset = tf.data.Dataset.from_tensor_slices((val_groups, val_masks))
+        val_dataset = val_dataset.map(load_and_preprocess_data, num_parallel_calls=tf.data.AUTOTUNE)
+        val_dataset = val_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        print("TF.data pipelines created.")
+
+        #3.Model Training.
+        print("\n--- PHASE 3: Model Training ---")
+        print("Building and compiling the HNCcorr model...")
+        model = build_hnccorr_model(INPUT_SHAPE)
+        model.summary() # Print summary
+        
+        lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=INITIAL_LEARNING_RATE,
+            decay_steps=len(train_dataset) * NUM_EPOCHS
+        )
+
+        model.compile(
+            optimizer=tf.keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-5),
+            loss=combo_loss,
+            metrics=[tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall')]
+        )
+        
+        f1_callback = F1ScoreCallback(validation_data=val_dataset)
+
+        print(f"\nStarting HNCcorr model training.")
+        history = model.fit(
+            train_dataset, 
+            epochs=NUM_EPOCHS, 
+            validation_data=val_dataset,
+            callbacks=[f1_callback]
+        )
+        print("\n\u2705 Training finished!")
+
+        print("\nSaving final model and plots.")
+        model.save(CHECKPOINT_PATH)
+        print(f"Trained model saved to: {CHECKPOINT_PATH}")
+        
+        plot_and_save_history(history, f1_callback, HISTORY_PLOT_PATH)
+
+        print("\nFinal Model Performance on Validation Set")
+        final_val_precision = history.history['val_precision'][-1]
+        final_val_recall = history.history['val_recall'][-1]
+        final_val_f1 = f1_callback.f1_history[-1]
+        
+        print(f"  - Validation Precision: {final_val_precision:.4f}")
+        print(f"  - Validation Recall:    {final_val_recall:.4f}")
+        print(f"  - Validation F1-Score:  {final_val_f1:.4f}")
+
+        #4.Inference
+        #Visualizations
+        val_dataset_for_viz = tf.data.Dataset.from_tensor_slices((val_groups, val_masks)).map(load_and_preprocess_data)
+        run_inference_and_visualize_detailed(model, val_dataset_for_viz, num_samples=8)
+
+        print("\nFinished.")
