@@ -1,7 +1,7 @@
 
 #Neurofinder, HNCcorr architecture with 15 Frame Temporal Stacking
 
-#Key imports.
+#Imports.
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks, backend as K
 import numpy as np
@@ -236,7 +236,7 @@ def build_hnccorr_model(input_shape):
     """Builds the HNCcorr model, now compatible with multi-frame input."""
     inputs = layers.Input(shape=input_shape)
     
-    #1.CNN ENCODER STEM ---
+    #1.CNN ENCODER STEM
     # The first Conv2D layer will automatically handle the 15-channel input.
     c1 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(inputs)
     c1 = layers.Conv2D(32, 3, activation='relu', padding='same', kernel_initializer='he_normal')(c1)
