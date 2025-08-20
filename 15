@@ -1,18 +1,9 @@
-# ==============================================================================
-#
-#       Neurofinder Pipeline: Enhanced Version
-#
-# This script includes:
-#   1. Pre-training visualization of the data preprocessing steps.
-#   2. A custom Keras callback to calculate F1-Score at each epoch.
-#   3. An updated plotting function to include the F1-Score graph.
-#   4. Detailed inference visualization on 8 random validation samples.
-#
-# ==============================================================================
+
+#Neurofinder Pipeline: Enhanced Version
 
 #%%
 
-# --- Core Imports ---
+#Core Imports
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
 from tensorflow.keras import backend as K
@@ -24,21 +15,21 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-# ==============================================================================
+# --------------------------------------------------------------------
 # PHASE 0: PARAMETERS & SETUP
-# ==============================================================================
+
 print("--- Initializing Parameters ---")
 
 # Enable mixed precision for a massive speedup on compatible GPUs.
 tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
-# -- Data Parameters
+# Data Parameters
 IMAGE_DIR = '/home/cdp200004/dataset/images'
 MASK_DIR = '/home/cdp200004/dataset/masks'
-SAVE_DIR = '/home/cdp200004/dataset/' #<-- Directory to save output files
+SAVE_DIR = '/home/cdp200004/dataset/'
 NUM_FRAMES = 15
 
-# -- Preprocessing & Visualization Parameters
+# Preprocessing & Visualization Parameters
 IMG_HEIGHT = 128
 IMG_WIDTH = 128
 OVERLAY_COLOR_GT = [0, 1, 0]    # Green for Ground Truth
@@ -48,21 +39,21 @@ BG_SIGMA = 10.0
 CLAHE_KERNEL_SIZE = [16, 16]
 CLAHE_CLIP_LIMIT = 2.0
 
-# -- Model & Training Parameters
+# Model & Training Parameters
 INPUT_SHAPE = (IMG_HEIGHT, IMG_WIDTH, NUM_FRAMES)
 INITIAL_LEARNING_RATE = 1e-3
 BATCH_SIZE = 16
 NUM_EPOCHS = 15
-# --- MODIFIED LINES: SAVING TO 'dataset' FOLDER WITH NEW NAMES ---
+# MODIFIED LINES: SAVING TO 'dataset' FOLDER WITH NEW NAMES
 CHECKPOINT_PATH = os.path.join(SAVE_DIR, "my_first_model15.keras")
 HISTORY_PLOT_PATH = os.path.join(SAVE_DIR, "my_first_history15.png")
 # --------------------------------------------------------------------
 VALIDATION_SPLIT = 0.2
 INFERENCE_THRESHOLD = 0.5
 
-# ==============================================================================
+
 # HELPER FUNCTION AND CLASS DEFINITIONS
-# ==============================================================================
+
 
 # Custom Callback to calculate F1-Score
 class F1ScoreCallback(callbacks.Callback):
@@ -99,7 +90,7 @@ class F1ScoreCallback(callbacks.Callback):
 
 @tf.function
 def apply_clahe(img, clip_limit, grid_size):
-    """Applies Contrast Limited Adaptive Histogram Equalization (CLAHE) to an image."""
+    """Applying (CLAHE) to an image."""
     img_shape = tf.shape(img)
     h, w = img_shape[0], img_shape[1]
     
@@ -355,8 +346,8 @@ def run_preprocessing_visualization(frame_paths, mask_paths, num_samples=8):
 
 def run_inference_and_visualize_detailed(model, dataset, num_samples=8):
     """Runs inference and creates detailed visualizations for random samples."""
-    print(f"\n--- PHASE 4: Detailed Inference and Visualization ---")
-    print(f"Running inference on {num_samples} random validation samples...")
+    print(f"\n Detailed Inference and Visualization ")
+    print(f"Running inference")
     center_frame_idx = NUM_FRAMES // 2
 
     for image_stack, gt_mask in dataset.shuffle(100).take(num_samples):
@@ -403,9 +394,9 @@ def run_inference_and_visualize_detailed(model, dataset, num_samples=8):
         plt.tight_layout(rect=[0, 0.05, 1, 0.95])
         plt.show()
 
-# ==============================================================================
+#-----------------------------------------------------------------
 # MAIN EXECUTION BLOCK
-# ==============================================================================
+
 if __name__ == "__main__":
     
     print("\nLocating data files...")
@@ -413,13 +404,13 @@ if __name__ == "__main__":
     all_mask_paths = sorted(glob.glob(os.path.join(MASK_DIR, '*.png')))
 
     if not all_image_paths or not all_mask_paths or len(all_image_paths) < NUM_FRAMES:
-        print(f"\n\u274C ERROR: Halting script. Not enough data found for {NUM_FRAMES}-frame stacks.")
+        print(f"\n\u274C Halting script.")
     else:
-        # --- PHASE 1: Preprocessing Visualization ---
+        #Preprocessing Visualization
         run_preprocessing_visualization(all_image_paths, all_mask_paths, num_samples=8)
 
-        # --- PHASE 2: Data Preparation ---
-        print(f"\n--- PHASE 2: Data Preparation & Model Training ---")
+        #Data Preparation
+        print(f"\n Data Preparation & Model Training")
         print(f"Found {len(all_image_paths)} images. Grouping into {NUM_FRAMES}-frame stacks...")
         frame_groups = []
         target_masks = []
@@ -444,8 +435,8 @@ if __name__ == "__main__":
         val_dataset = val_dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
         print("Datasets with temporal stacking and augmentation created successfully.")
 
-        # --- PHASE 3: Model Training ---
-        print("\n--- PHASE 3: Model Training ---")
+        #Model Training
+        print("\n Model Training")
         print("Building and compiling the U-Net model...")
         model = build_unet_model(INPUT_SHAPE)
         
@@ -464,25 +455,25 @@ if __name__ == "__main__":
             metrics=[tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall')]
         )
         
-        # Instantiate the custom F1 Score callback
+        #Instantiate the custom F1 Score callback
         f1_callback = F1ScoreCallback(validation_data=val_dataset)
 
-        print(f"\nStarting model training for {NUM_EPOCHS} epochs... 🚀")
+        print(f"\n Starting model training for {NUM_EPOCHS} epochs... 🚀")
         history = model.fit(
             train_dataset, 
             epochs=NUM_EPOCHS, 
             validation_data=val_dataset,
             callbacks=[f1_callback] # Add the callback here
         )
-        print("\n\u2705 Training finished!")
+        print("\n Training finished ")
 
-        print("\nSaving final model and performance plots...")
+        print("\n Saving final model and performance plots...")
         model.save(CHECKPOINT_PATH)
-        print(f"Trained model saved to: {CHECKPOINT_PATH}")
+        print(f"Trained model saved ")
         
         plot_and_save_history(history, f1_callback, HISTORY_PLOT_PATH)
 
-        print("\n--- Final Model Performance on Validation Set ---")
+        print("\n Final Model Performance ")
         final_val_precision = history.history['val_precision'][-1]
         final_val_recall = history.history['val_recall'][-1]
         final_val_f1 = f1_callback.f1_history[-1] # Get the last F1 score from our callback
@@ -491,8 +482,8 @@ if __name__ == "__main__":
         print(f"  - Validation Recall:    {final_val_recall:.4f}")
         print(f"  - Validation F1-Score:  {final_val_f1:.4f}")
 
-        # --- PHASE 4: Detailed Inference ---
+        #Detailed Inference
         val_dataset_for_inference = tf.data.Dataset.from_tensor_slices((val_groups, val_masks)).map(load_and_preprocess_data)
         run_inference_and_visualize_detailed(model, val_dataset_for_inference, num_samples=8)
 
-        print("\n--- ✅ SCRIPT FINISHED. ---")
+        print("\n FINISHED")
